@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused MoE utilities for GPTQ."""
 
+import functools
 import math
 from collections.abc import Callable
 
@@ -9,6 +10,7 @@ import torch
 
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
     MoEActivation,
@@ -55,6 +57,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
+logger = init_logger(__name__)
 
 
 def _fused_marlin_moe(
@@ -221,6 +225,143 @@ def _fused_marlin_moe(
     return output
 
 
+# The Marlin MoE kernel (csrc/moe/marlin_moe_wna16/ops.cu) chooses a thread tile
+# per GEMM from the tables below and rejects the launch if no tile fits the
+# device's shared memory (with a 512 B margin). Shared-memory use grows with the
+# token block size, so a block that is fine on a 228 KB datacenter GPU can be
+# rejected on a 99 KB consumer/workstation GPU (SM86/SM89/SM12x). The helpers
+# below mirror the kernel's tile table and `get_kernel_cache_size` so Python
+# can pick the largest block the kernel will accept instead of crashing.
+# Keep in sync with ops.cu.
+_MARLIN_MOE_THREAD_CONFIGS_SMALL = ((128, 128, 256), (64, 128, 128), (128, 64, 128))
+_MARLIN_MOE_THREAD_CONFIGS_LARGE = ((64, 256, 256), (64, 128, 128), (128, 64, 128))
+_MARLIN_MOE_STAGES = 4
+_MARLIN_MOE_SMEM_MARGIN = 512
+_MARLIN_MOE_BLOCK_SIZES = (64, 48, 32, 16, 8)
+
+
+@functools.cache
+def _marlin_max_shared_mem_per_block(device_index: int) -> int | None:
+    props = torch.cuda.get_device_properties(device_index)
+    # ROCm does not expose this attribute; the kernel is CUDA-only anyway.
+    return getattr(props, "shared_memory_per_block_optin", None)
+
+
+def _marlin_moe_tile_smem_bytes(
+    thread_k: int,
+    thread_n: int,
+    tb_m: int,
+    num_bits: int,
+    group_size: int,
+    has_zp: bool,
+    is_a_8bit: bool,
+) -> int:
+    """Shared memory one thread block needs; mirrors ops.cu get_kernel_cache_size."""
+    stages = _MARLIN_MOE_STAGES
+    pack_factor = 32 // num_bits
+    sh_block_meta = tb_m * 16
+    sh_a = stages * tb_m * thread_k * (1 if is_a_8bit else 2)
+    sh_b = stages * (thread_k * thread_n // pack_factor) * 4
+    sh_red = tb_m * (thread_n + 8) * 2
+    sh_bias = thread_n * 2
+    tmp = max(sh_b, sh_red, min(sh_b, sh_red) + sh_bias)
+    tb_groups = 1 if group_size == -1 else -(-thread_k // group_size)
+    sh_s = tb_groups * thread_n * 2 * stages
+    sh_zp = 0
+    if has_zp:
+        sh_zp = sh_s // 4 if num_bits == 4 else sh_s // 2
+    return tmp + sh_a + sh_s + sh_zp + sh_block_meta
+
+
+def _marlin_moe_gemm_fits(
+    block_size_m: int,
+    prob_n: int,
+    prob_k: int,
+    num_bits: int,
+    group_size: int,
+    has_zp: bool,
+    is_a_8bit: bool,
+    smem_budget: int,
+) -> bool:
+    thread_m_blocks = -(-block_size_m // 16)
+    tb_m = thread_m_blocks * 16
+    configs = (
+        _MARLIN_MOE_THREAD_CONFIGS_LARGE
+        if thread_m_blocks > 1
+        else _MARLIN_MOE_THREAD_CONFIGS_SMALL
+    )
+    for thread_k, thread_n, _ in configs:
+        if prob_k % thread_k != 0 or prob_n % thread_n != 0:
+            continue
+        if (
+            _marlin_moe_tile_smem_bytes(
+                thread_k, thread_n, tb_m, num_bits, group_size, has_zp, is_a_8bit
+            )
+            <= smem_budget
+        ):
+            return True
+    return False
+
+
+@functools.cache
+def marlin_moe_fit_block_size_m(
+    block_size_m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    w13_num_shards: int,
+    num_bits: int,
+    group_size1: int,
+    group_size2: int,
+    has_zp: bool,
+    is_a_8bit: bool,
+    device: torch.device,
+    max_shared_mem: int | None = None,
+) -> int:
+    """Largest block size <= ``block_size_m`` for which both MoE GEMMs have a
+    thread tile that fits the device's shared memory. Returns ``block_size_m``
+    unchanged when the limit is unknown or when no smaller block helps (the
+    kernel then reports the failure as before). Every argument is static per
+    layer except ``block_size_m`` (five values), so the result is memoized and
+    the per-call cost is a cache lookup."""
+    if max_shared_mem is None:
+        if device.type != "cuda":
+            return block_size_m
+        max_shared_mem = _marlin_max_shared_mem_per_block(device.index or 0)
+        if max_shared_mem is None:
+            return block_size_m
+    budget = max_shared_mem - _MARLIN_MOE_SMEM_MARGIN
+    # (prob_n, prob_k, group_size) for gate-up and down GEMMs.
+    gemms = (
+        (w13_num_shards * intermediate_size, hidden_size, group_size1),
+        (hidden_size, intermediate_size, group_size2),
+    )
+    # 1-byte activations need block_size_m >= 16 (see callers).
+    min_block = 16 if is_a_8bit else _MARLIN_MOE_BLOCK_SIZES[-1]
+    for bm in _MARLIN_MOE_BLOCK_SIZES:
+        if bm > block_size_m or bm < min_block:
+            continue
+        if all(
+            _marlin_moe_gemm_fits(bm, n, k, num_bits, g, has_zp, is_a_8bit, budget)
+            for n, k, g in gemms
+        ):
+            if bm != block_size_m:
+                logger.debug(
+                    "Marlin MoE: block_size_m %d -> %d to fit %d B shared memory",
+                    block_size_m,
+                    bm,
+                    max_shared_mem,
+                )
+            return bm
+    return block_size_m
+
+
+def _marlin_scale_group_size(scale: torch.Tensor, size_k: int) -> int:
+    # Marlin MoE scales are [E, size_k // group_size, size_n]; one row means
+    # channel-wise (group_size == -1).
+    groups = scale.size(1)
+    return -1 if groups <= 1 else size_k // groups
+
+
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -345,6 +486,20 @@ def fused_marlin_moe(
 
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
+
+    N = marlin_moe_intermediate_size(w1, w2)
+    block_size_m = marlin_moe_fit_block_size_m(
+        block_size_m,
+        hidden_size=K,
+        intermediate_size=N,
+        w13_num_shards=2 if activation.is_gated else 1,
+        num_bits=num_bits,
+        group_size1=_marlin_scale_group_size(w1_scale, K),
+        group_size2=_marlin_scale_group_size(w2_scale, N),
+        has_zp=w1_zeros is not None or w2_zeros is not None,
+        is_a_8bit=input_dtype is not None and input_dtype.itemsize == 1,
+        device=hidden_states.device,
+    )
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids,
@@ -506,6 +661,20 @@ def batched_fused_marlin_moe(
 
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
+
+    N = marlin_moe_intermediate_size(w1, w2)
+    block_size_m = marlin_moe_fit_block_size_m(
+        block_size_m,
+        hidden_size=K,
+        intermediate_size=N,
+        w13_num_shards=2 if activation.is_gated else 1,
+        num_bits=num_bits,
+        group_size1=_marlin_scale_group_size(w1_scale, K),
+        group_size2=_marlin_scale_group_size(w2_scale, N),
+        has_zp=w1_zeros is not None or w2_zeros is not None,
+        is_a_8bit=input_dtype is not None and input_dtype.itemsize == 1,
+        device=hidden_states.device,
+    )
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = batched_moe_align_block_size(
         max_tokens_per_batch=BATCH_TOKENS_MAX,
